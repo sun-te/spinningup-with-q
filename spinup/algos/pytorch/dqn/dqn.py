@@ -83,16 +83,21 @@ def dqn(env_fn,  q_kwargs=dict(), seed=0,
     # Set up function for computing double Q-loss
     def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-        q = q_func(Variable(o)).gather(1, Variable(a).unsqueeze(1))
+        r = Variable(r)
+        o2 = Variable(o2)
+        a = Variable(a)
+        o = Variable(o)
+        d = Variable(d)
+        q = q_func(o).gather(1, a.unsqueeze(1))
         # Bellman backup for Q function
         with torch.no_grad():
             # TODO: change the action you choose
-            q_targ = q_target(Variable(o2)).detach().max(1)[0]
+            q_targ = q_target(o2).detach().max(1)[0]
             backup = r + gamma * (1 - d) * q_targ
         # MSE loss against Bellman backup
         loss_q = ((q - backup) ** 2).mean()
         # Useful info for logging
-        loss_info = dict(QVals=q.detach().numpy())
+        loss_info = dict(QVals=q.cpu().detach().numpy())
         return loss_q, loss_info
 
     q_optimizer = Adam(q_func.parameters(), lr=q_lr)
