@@ -1,13 +1,26 @@
 from copy import deepcopy
+import os
 import itertools
 import numpy as np
 import torch
 from torch.optim import Adam
 import gym
 import time
+from datetime import datetime
 import spinup.algos.pytorch.sac.core as core
 from spinup.utils.logx import EpochLogger
+from tensorboardX import SummaryWriter
 
+
+tf_logger = "logs/sac_"+datetime.now().strftime('%Y%m%d%H%M%S')+'/'
+writer = SummaryWriter(logdir=tf_logger)
+# python -m spinup.algos.pytorch.sac.sac --epochs 2000 --exp_name sac0 -s 0
+# python -m spinup.algos.pytorch.sac.sac --epochs 2000 --exp_name sac1 -s 1
+# python -m spinup.algos.pytorch.sac.sac --epochs 2000 --exp_name sac2 -s 2
+# python -m spinup.algos.pytorch.sac.sac --epochs 2000 --exp_name sac4 -s 4
+def Variable(var):
+    return var.to(device)
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
 class ReplayBuffer:
     """
@@ -41,12 +54,13 @@ class ReplayBuffer:
         return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
 
 
-
+test_reward_buffer = []
+train_reward_buffer = []
 def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1):
+        logger_kwargs=dict(), save_freq=100):
     """
     Soft Actor-Critic (SAC)
 
@@ -158,8 +172,8 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     act_limit = env.action_space.high[0]
 
     # Create actor-critic module and target networks
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
-    ac_targ = deepcopy(ac)
+    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs).to(device)
+    ac_targ = deepcopy(ac).to(device)
 
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
     for p in ac_targ.parameters():
@@ -178,7 +192,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up function for computing SAC Q-losses
     def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-
+        o, a, r, o2, d = Variable(o), Variable(a), Variable(r), Variable(o2), Variable(d)
         q1 = ac.q1(o,a)
         q2 = ac.q2(o,a)
 
@@ -199,24 +213,24 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
-        q_info = dict(Q1Vals=q1.detach().numpy(),
-                      Q2Vals=q2.detach().numpy())
+        q_info = dict(Q1Vals=q1.cpu().detach().numpy(),
+                      Q2Vals=q2.cpu().detach().numpy())
 
         return loss_q, q_info
 
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
+        o = Variable(o)
         pi, logp_pi = ac.pi(o)
         q1_pi = ac.q1(o, pi)
         q2_pi = ac.q2(o, pi)
         q_pi = torch.min(q1_pi, q2_pi)
-
         # Entropy-regularized policy loss
         loss_pi = (alpha * logp_pi - q_pi).mean()
 
         # Useful info for logging
-        pi_info = dict(LogPi=logp_pi.detach().numpy())
+        pi_info = dict(LogPi=logp_pi.cpu().detach().numpy())
 
         return loss_pi, pi_info
 
@@ -264,17 +278,20 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 p_targ.data.add_((1 - polyak) * p.data)
 
     def get_action(o, deterministic=False):
-        return ac.act(torch.as_tensor(o, dtype=torch.float32), 
+        action = ac.act(torch.as_tensor(o, device=device, dtype=torch.float32),
                       deterministic)
+        return action.cpu().numpy()
 
     def test_agent():
         for j in range(num_test_episodes):
             o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
             while not(d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time 
+                # Take deterministic actions at test time
                 o, r, d, _ = test_env.step(get_action(o, True))
                 ep_ret += r
                 ep_len += 1
+            writer.add_scalar(tag='test_reward', scalar_value=ep_ret, global_step=t)
+            test_reward_buffer.append((t, ep_ret))
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
 
     # Prepare for interaction with environment
@@ -313,6 +330,8 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # End of trajectory handling
         if d or (ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
+            writer.add_scalar(tag='train_reward', scalar_value=ep_ret, global_step=t)
+            train_reward_buffer.append((t, ep_ret))
             o, ep_ret, ep_len = env.reset(), 0, 0
 
         # Update handling
@@ -328,7 +347,13 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             # Save model
             if (epoch % save_freq == 0) or (epoch == epochs):
                 logger.save_state({'env': env}, None)
-
+                output_dir = logger_kwargs['output_dir']+'/'
+                test_rewards = np.array(test_reward_buffer)
+                train_rewards = np.array(train_reward_buffer)
+                train_file_name = os.path.join(output_dir,'{}_train_rewards.npy'.format(seed))
+                test_file_name = os.path.join(output_dir,'{}_test_rewards.npy'.format(seed))
+                np.save(train_file_name, train_rewards)
+                np.save(test_file_name, test_rewards)
             # Test the performance of the deterministic version of the agent.
             test_agent()
 
@@ -346,11 +371,12 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()
+    writer.close()
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='HalfCheetah-v2')
+    parser.add_argument('--env', type=str, default='Ant-v2')
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
@@ -363,7 +389,6 @@ if __name__ == '__main__':
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
     torch.set_num_threads(torch.get_num_threads())
-
     sac(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
