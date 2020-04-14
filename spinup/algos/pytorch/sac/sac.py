@@ -12,8 +12,8 @@ from spinup.utils.logx import EpochLogger
 from tensorboardX import SummaryWriter
 
 
-tf_logger = "logs/sac_"+datetime.now().strftime('%Y%m%d%H%M%S')+'/'
-writer = SummaryWriter(logdir=tf_logger)
+# tf_logger = "logs/sac_"+datetime.now().strftime('%Y%m%d%H%M%S')+'/'
+# writer = SummaryWriter(logdir=tf_logger)
 # python -m spinup.algos.pytorch.sac.sac --epochs 2000 --exp_name sac0 -s 0
 # python -m spinup.algos.pytorch.sac.sac --epochs 2000 --exp_name sac1 -s 1
 # python -m spinup.algos.pytorch.sac.sac --epochs 2000 --exp_name sac2 -s 2
