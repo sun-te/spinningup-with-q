@@ -269,7 +269,6 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     vf_pi_optimizer = Adam(ac.v_pi.parameters(), lr=vf_lr)
     # Set up model savingF
     logger.setup_pytorch_saver(ac)
-
     def update():
         data = buf.get()
 
@@ -316,7 +315,7 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi, pi_info = compute_loss_pi(data)
             kl = mpi_avg(pi_info['kl'])
             if kl > 1.5 * target_kl:
-                logger.log('Early stopping at step %d due to reaching max kl.' % i)
+                # logger.log('Early stopping at step %d due to reaching max kl.' % i)
                 break
             loss_pi.backward()
             mpi_avg_grads(ac.pi)  # average grads across MPI processes
@@ -328,6 +327,7 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_v.backward()
             mpi_avg_grads(ac.v_pi)
             vf_pi_optimizer.step()
+        print("Pi loss:     {}".format(pi_l_old))
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
         logger.store(LossPi=pi_l_old, LossV=v_l_old,
                      KL=kl, Entropy=ent, ClipFrac=cf,
@@ -345,11 +345,13 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             mpi_avg_grads(ac.v)
             vf_optimizer.step()
 
+    # pretraining epochs
+    pi_epochs, vf_epochs = 100, 50
 
     # demonstration training: main loop, for policy network
     o, ep_ret, ep_len = demo_env.reset(), 0, 0
     start_time = time.time()
-    for epoch in range(50):
+    for epoch in range(pi_epochs):
         for t in range(steps_per_epoch):
             a, v, logp_a, m, std = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
             next_o, r, d, _ = demo_env.step(a, std)
@@ -370,14 +372,13 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     _, v, _, _, _ = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
                 else:
                     v = 0
-                buf.finish_path(v)
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
+                buf.finish_path(v)
                 o, ep_ret, ep_len = demo_env.reset(), 0, 0
         demo_update()
         # Log info about epoch
-        print("Demonstration training")
         logger.log_tabular('Epoch', epoch)
         logger.log_tabular('EpRet', with_min_and_max=True)
         logger.log_tabular('EpLen', average_only=True)
@@ -394,13 +395,14 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('Time', time.time() - start_time)
         logger.dump_tabular()
 
+
     # for the value function pre-training
     o, ep_ret, ep_len = demo_env.reset(), 0, 0
     start_time = time.time()
-    for epoch in range(50):
+    for epoch in range(vf_epochs):
         for t in range(steps_per_epoch):
             next_o, r, d, _, a = demo_env.free_step()
-            v = ac.v(torch.as_tensor(o, dtype=torch.float32)).numpy()
+            v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
             ep_ret += r
             ep_len += 1
             buf.store(o, a, r, v, 1)
@@ -414,16 +416,14 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    v = ac.v(torch.as_tensor(o, dtype=torch.float32))
+                    v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
                 else:
                     v = 0
                 buf.finish_path(v)
-                if terminal:
-                    # only save EpRet / EpLen if trajectory finished
-                    logger.store(EpRet=ep_ret, EpLen=ep_len)
                 o, ep_ret, ep_len = demo_env.reset(), 0, 0
         print("Pretraining for value function at Epoch: {}".format(epoch))
         update_vf()
+
 
     # Prepare for interaction with environment
     start_time = time.time()
@@ -499,8 +499,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=1)
     parser.add_argument('--steps', type=int, default=40000)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--exp_name', type=str, default='ppo')
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--exp_name', type=str, default='test')
     parser.add_argument('--demo-file', type=str, default='data/Ant50epoch.pickle')
     args = parser.parse_args()
 

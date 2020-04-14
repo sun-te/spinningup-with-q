@@ -55,7 +55,7 @@ class DemoGymEnv(gym.Env):
         # only for continual control
         d = 0.5 - abs(0.5-norm.cdf(x=(act-buf_act)/stddev))
         log_p =  sum(- (act - buf_act)**2 / (2*stddev**2) - 0.5 * np.log(2*np.pi*stddev**2))
-        r = np.exp(log_p) * abs(buf_r)
+        r = np.exp(log_p) # * abs(buf_r)
 
         return r
 
