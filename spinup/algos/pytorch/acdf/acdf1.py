@@ -12,11 +12,9 @@ from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_sc
 
 from spinup.algos.pytorch.acdf.demo_env import DemoGymEnv
 
-
 def Variable(var):
     return var.to(device)
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-
 
 class ACDFBuffer:
     """
@@ -228,7 +226,6 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Sync params across processes
     sync_params(ac)
-
     # Count variables
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v, ac.v_pi])
     logger.log('\nNumber of parameters: \t pi: %d, \t v: %d and v_pi: %d\n'%var_counts)
@@ -305,124 +302,124 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
                      DeltaLossV=(loss_v.item() - v_l_old))
 
-    def demo_update():
-        data = buf.get()
-        pi_l_old, pi_info_old = compute_loss_pi(data)
-        pi_l_old = pi_l_old.item()
-        v_l_old = compute_loss_v_pi(data).item()
-        for i in range(train_pi_iters):
-            pi_optimizer.zero_grad()
-            loss_pi, pi_info = compute_loss_pi(data)
-            kl = mpi_avg(pi_info['kl'])
-            if kl > 1.5 * target_kl:
-                # logger.log('Early stopping at step %d due to reaching max kl.' % i)
-                break
-            loss_pi.backward()
-            mpi_avg_grads(ac.pi)  # average grads across MPI processes
-            pi_optimizer.step()
-        logger.store(StopIter=i)
-        for i in range(train_v_iters):
-            vf_pi_optimizer.zero_grad()
-            loss_v = compute_loss_v_pi(data)
-            loss_v.backward()
-            mpi_avg_grads(ac.v_pi)
-            vf_pi_optimizer.step()
-        print("Pi loss:     {}".format(pi_l_old))
-        kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
-        logger.store(LossPi=pi_l_old, LossV=v_l_old,
-                     KL=kl, Entropy=ent, ClipFrac=cf,
-                     DeltaLossPi=(loss_pi.item() - pi_l_old),
-                     DeltaLossV=(loss_v.item() - v_l_old))
-
-    def update_vf():
-        data = buf.get()
-        v_l_old = compute_loss_v(data).item()
-        print("Loss for Value function: {}".format(v_l_old))
-        for i in range(train_v_iters):
-            vf_optimizer.zero_grad()
-            loss_v = compute_loss_v(data)
-            loss_v.backward()
-            mpi_avg_grads(ac.v)
-            vf_optimizer.step()
+    # def demo_update():
+    #     data = buf.get()
+    #     pi_l_old, pi_info_old = compute_loss_pi(data)
+    #     pi_l_old = pi_l_old.item()
+    #     v_l_old = compute_loss_v_pi(data).item()
+    #     for i in range(train_pi_iters):
+    #         pi_optimizer.zero_grad()
+    #         loss_pi, pi_info = compute_loss_pi(data)
+    #         kl = mpi_avg(pi_info['kl'])
+    #         if kl > 1.5 * target_kl:
+    #             # logger.log('Early stopping at step %d due to reaching max kl.' % i)
+    #             break
+    #         loss_pi.backward()
+    #         mpi_avg_grads(ac.pi)  # average grads across MPI processes
+    #         pi_optimizer.step()
+    #     logger.store(StopIter=i)
+    #     for i in range(train_v_iters):
+    #         vf_pi_optimizer.zero_grad()
+    #         loss_v = compute_loss_v_pi(data)
+    #         loss_v.backward()
+    #         mpi_avg_grads(ac.v_pi)
+    #         vf_pi_optimizer.step()
+    #     print("Pi loss:     {}".format(pi_l_old))
+    #     kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
+    #     logger.store(LossPi=pi_l_old, LossV=v_l_old,
+    #                  KL=kl, Entropy=ent, ClipFrac=cf,
+    #                  DeltaLossPi=(loss_pi.item() - pi_l_old),
+    #                  DeltaLossV=(loss_v.item() - v_l_old))
+    #
+    # def update_vf():
+    #     data = buf.get()
+    #     v_l_old = compute_loss_v(data).item()
+    #     print("Loss for Value function: {}".format(v_l_old))
+    #     for i in range(train_v_iters):
+    #         vf_optimizer.zero_grad()
+    #         loss_v = compute_loss_v(data)
+    #         loss_v.backward()
+    #         mpi_avg_grads(ac.v)
+    #         vf_optimizer.step()
 
     # pretraining epochs
     # pi_epochs, vf_epochs = 100, 50
 
-    # demonstration training: main loop, for policy network
-    o, ep_ret, ep_len = demo_env.reset(), 0, 0
-    start_time = time.time()
-    for epoch in range(pi_epochs):
-        for t in range(steps_per_epoch):
-            a, v, logp_a, m, std = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
-            next_o, r, d, _ = demo_env.step(a, std)
-            ep_ret += r
-            ep_len += 1
-
-            buf.store(o, a, r, v, logp_a, std=std)
-            logger.store(VVals=v)
-            o = next_o
-            timeout = ep_len == max_ep_len
-            terminal = d or timeout
-            epoch_ended = t == steps_per_epoch - 1
-            if terminal or epoch_ended:
-                if epoch_ended and not (terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
-                # if trajectory didn't reach terminal state, bootstrap value target
-                if timeout or epoch_ended:
-                    _, v, _, _, _ = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
-                else:
-                    v = 0
-                if terminal:
-                    # only save EpRet / EpLen if trajectory finished
-                    logger.store(EpRet=ep_ret, EpLen=ep_len)
-                buf.finish_path(v)
-                o, ep_ret, ep_len = demo_env.reset(), 0, 0
-        demo_update()
-        # Log info about epoch
-        logger.log_tabular('Epoch', epoch)
-        logger.log_tabular('EpRet', with_min_and_max=True)
-        logger.log_tabular('EpLen', average_only=True)
-        logger.log_tabular('VVals', with_min_and_max=True)
-        logger.log_tabular('TotalEnvInteracts', (epoch + 1) * steps_per_epoch)
-        logger.log_tabular('LossPi', average_only=True)
-        logger.log_tabular('LossV', average_only=True)
-        logger.log_tabular('DeltaLossPi', average_only=True)
-        logger.log_tabular('DeltaLossV', average_only=True)
-        logger.log_tabular('Entropy', average_only=True)
-        logger.log_tabular('KL', average_only=True)
-        logger.log_tabular('ClipFrac', average_only=True)
-        logger.log_tabular('StopIter', average_only=True)
-        logger.log_tabular('Time', time.time() - start_time)
-        logger.dump_tabular()
-
-
-    # for the value function pre-training
-    o, ep_ret, ep_len = demo_env.reset(), 0, 0
-    start_time = time.time()
-    for epoch in range(vf_epochs):
-        for t in range(steps_per_epoch):
-            next_o, r, d, _, a = demo_env.free_step()
-            v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
-            ep_ret += r
-            ep_len += 1
-            buf.store(o, a, r, v, 1)
-            logger.store(VVals=v)
-            o = next_o
-            timeout = ep_len == max_ep_len
-            terminal = d or timeout
-            epoch_ended = t == steps_per_epoch - 1
-            if terminal or epoch_ended:
-                if epoch_ended and not (terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
-                # if trajectory didn't reach terminal state, bootstrap value target
-                if timeout or epoch_ended:
-                    v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
-                else:
-                    v = 0
-                buf.finish_path(v)
-                o, ep_ret, ep_len = demo_env.reset(), 0, 0
-        print("Pretraining for value function at Epoch: {}".format(epoch))
-        update_vf()
+    # # demonstration training: main loop, for policy network
+    # o, ep_ret, ep_len = demo_env.reset(), 0, 0
+    # start_time = time.time()
+    # for epoch in range(pi_epochs):
+    #     for t in range(steps_per_epoch):
+    #         a, v, logp_a, m, std = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
+    #         next_o, r, d, _ = demo_env.step(a, std)
+    #         ep_ret += r
+    #         ep_len += 1
+    #
+    #         buf.store(o, a, r, v, logp_a, std=std)
+    #         logger.store(VVals=v)
+    #         o = next_o
+    #         timeout = ep_len == max_ep_len
+    #         terminal = d or timeout
+    #         epoch_ended = t == steps_per_epoch - 1
+    #         if terminal or epoch_ended:
+    #             if epoch_ended and not (terminal):
+    #                 print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
+    #             # if trajectory didn't reach terminal state, bootstrap value target
+    #             if timeout or epoch_ended:
+    #                 _, v, _, _, _ = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
+    #             else:
+    #                 v = 0
+    #             if terminal:
+    #                 # only save EpRet / EpLen if trajectory finished
+    #                 logger.store(EpRet=ep_ret, EpLen=ep_len)
+    #             buf.finish_path(v)
+    #             o, ep_ret, ep_len = demo_env.reset(), 0, 0
+    #     demo_update()
+    #     # Log info about epoch
+    #     logger.log_tabular('Epoch', epoch)
+    #     logger.log_tabular('EpRet', with_min_and_max=True)
+    #     logger.log_tabular('EpLen', average_only=True)
+    #     logger.log_tabular('VVals', with_min_and_max=True)
+    #     logger.log_tabular('TotalEnvInteracts', (epoch + 1) * steps_per_epoch)
+    #     logger.log_tabular('LossPi', average_only=True)
+    #     logger.log_tabular('LossV', average_only=True)
+    #     logger.log_tabular('DeltaLossPi', average_only=True)
+    #     logger.log_tabular('DeltaLossV', average_only=True)
+    #     logger.log_tabular('Entropy', average_only=True)
+    #     logger.log_tabular('KL', average_only=True)
+    #     logger.log_tabular('ClipFrac', average_only=True)
+    #     logger.log_tabular('StopIter', average_only=True)
+    #     logger.log_tabular('Time', time.time() - start_time)
+    #     logger.dump_tabular()
+    #
+    #
+    # # for the value function pre-training
+    # o, ep_ret, ep_len = demo_env.reset(), 0, 0
+    # start_time = time.time()
+    # for epoch in range(vf_epochs):
+    #     for t in range(steps_per_epoch):
+    #         next_o, r, d, _, a = demo_env.free_step()
+    #         v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
+    #         ep_ret += r
+    #         ep_len += 1
+    #         buf.store(o, a, r, v, 1)
+    #         logger.store(VVals=v)
+    #         o = next_o
+    #         timeout = ep_len == max_ep_len
+    #         terminal = d or timeout
+    #         epoch_ended = t == steps_per_epoch - 1
+    #         if terminal or epoch_ended:
+    #             if epoch_ended and not (terminal):
+    #                 print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
+    #             # if trajectory didn't reach terminal state, bootstrap value target
+    #             if timeout or epoch_ended:
+    #                 v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
+    #             else:
+    #                 v = 0
+    #             buf.finish_path(v)
+    #             o, ep_ret, ep_len = demo_env.reset(), 0, 0
+    #     print("Pretraining for value function at Epoch: {}".format(epoch))
+    #     update_vf()
 
 
     # Prepare for interaction with environment
@@ -497,7 +494,7 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=1)
+    parser.add_argument('--cpu', type=int, default=4)
     parser.add_argument('--steps', type=int, default=40000)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--exp_name', type=str, default='test')
