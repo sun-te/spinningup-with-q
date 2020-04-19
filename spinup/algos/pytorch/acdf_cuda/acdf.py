@@ -3,20 +3,18 @@ import torch
 from torch.optim import Adam
 import gym
 import time
-from ipdb import set_trace as tt
 
-import spinup.algos.pytorch.acdf.core as core
+
+import spinup.algos.pytorch.acdf_cuda.core as core
 from spinup.utils.logx import EpochLogger
-from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
-from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+from spinup.utils.mpi_pytorch_cuda import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
+from spinup.utils.mpi_tools_cuda import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
 from spinup.algos.pytorch.acdf.demo_env import DemoGymEnv
-
 
 def Variable(var):
     return var.to(device)
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-
 
 class ACDFBuffer:
     """
@@ -92,116 +90,14 @@ class ACDFBuffer:
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     adv=self.adv_buf, logp=self.logp_buf, std=self.std_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32, device=device) for k,v in data.items()}
 
 
 
 def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=50, pi_epochs=100, vf_epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10, demo_file=""):
-    """
-    Proximal Policy Optimization (by clipping), 
-
-    with early stopping based on approximate KL
-
-    Args:
-        env_fn : A function which creates a copy of the environment.
-            The environment must satisfy the OpenAI Gym API.
-
-        actor_critic: The constructor method for a PyTorch Module with a 
-            ``step`` method, an ``act`` method, a ``pi`` module, and a ``v`` 
-            module. The ``step`` method should accept a batch of observations 
-            and return:
-
-            ===========  ================  ======================================
-            Symbol       Shape             Description
-            ===========  ================  ======================================
-            ``a``        (batch, act_dim)  | Numpy array of actions for each 
-                                           | observation.
-            ``v``        (batch,)          | Numpy array of value estimates
-                                           | for the provided observations.
-            ``logp_a``   (batch,)          | Numpy array of log probs for the
-                                           | actions in ``a``.
-            ===========  ================  ======================================
-
-            The ``act`` method behaves the same as ``step`` but only returns ``a``.
-
-            The ``pi`` module's forward call should accept a batch of 
-            observations and optionally a batch of actions, and return:
-
-            ===========  ================  ======================================
-            Symbol       Shape             Description
-            ===========  ================  ======================================
-            ``pi``       N/A               | Torch Distribution object, containing
-                                           | a batch of distributions describing
-                                           | the policy for the provided observations.
-            ``logp_a``   (batch,)          | Optional (only returned if batch of
-                                           | actions is given). Tensor containing 
-                                           | the log probability, according to 
-                                           | the policy, of the provided actions.
-                                           | If actions not given, will contain
-                                           | ``None``.
-            ===========  ================  ======================================
-
-            The ``v`` module's forward call should accept a batch of observations
-            and return:
-
-            ===========  ================  ======================================
-            Symbol       Shape             Description
-            ===========  ================  ======================================
-            ``v``        (batch,)          | Tensor containing the value estimates
-                                           | for the provided observations. (Critical: 
-                                           | make sure to flatten this!)
-            ===========  ================  ======================================
-
-
-        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-            you provided to PPO.
-
-        seed (int): Seed for random number generators.
-
-        steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
-            for the agent and the environment in each epoch.
-
-        epochs (int): Number of epochs of interaction (equivalent to
-            number of policy updates) to perform.
-
-        gamma (float): Discount factor. (Always between 0 and 1.)
-
-        clip_ratio (float): Hyperparameter for clipping in the policy objective.
-            Roughly: how far can the new policy go from the old policy while 
-            still profiting (improving the objective function)? The new policy 
-            can still go farther than the clip_ratio says, but it doesn't help
-            on the objective anymore. (Usually small, 0.1 to 0.3.) Typically
-            denoted by :math:`\epsilon`. 
-
-        pi_lr (float): Learning rate for policy optimizer.
-
-        vf_lr (float): Learning rate for value function optimizer.
-
-        train_pi_iters (int): Maximum number of gradient descent steps to take 
-            on policy loss per epoch. (Early stopping may cause optimizer
-            to take fewer than this.)
-
-        train_v_iters (int): Number of gradient descent steps to take on 
-            value function per epoch.
-
-        lam (float): Lambda for GAE-Lambda. (Always between 0 and 1,
-            close to 1.)
-
-        max_ep_len (int): Maximum length of trajectory / episode / rollout.
-
-        target_kl (float): Roughly what KL divergence we think is appropriate
-            between new and old policies after an update. This will get used 
-            for early stopping. (Usually small, 0.01 or 0.05.)
-
-        logger_kwargs (dict): Keyword args for EpochLogger.
-
-        save_freq (int): How often (in terms of gap between epochs) to save
-            the current policy and value function.
-
-    """
+        target_kl=0.01, logger_kwargs=dict(), save_freq=10):
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
     setup_pytorch_for_mpi()
@@ -220,17 +116,14 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
 
-    # demo environment
-    demo_env = DemoGymEnv(demo_file=demo_file, seed=seed)
-    demo_env.check_env(env)
     # Create actor-critic module
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs).to(device)
+    # TODO: load the pretrain model
 
     # Sync params across processes
     sync_params(ac)
-
     # Count variables
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v, ac.v_pi])
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
     logger.log('\nNumber of parameters: \t pi: %d, \t v: %d and v_pi: %d\n'%var_counts)
 
     # Set up experience buffer
@@ -239,7 +132,7 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Set up function for computing PPO policy loss
     def compute_loss_pi(data):
-        obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
+        obs, act, adv, logp_old = Variable(data['obs']), Variable(data['act']), Variable(data['adv']), Variable(data['logp'])
 
         # Policy loss
         pi, logp = ac.pi(obs, act)
@@ -251,31 +144,26 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         approx_kl = (logp_old - logp).mean().item()
         ent = pi.entropy().mean().item()
         clipped = ratio.gt(1+clip_ratio) | ratio.lt(1-clip_ratio)
-        clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
+        clipfrac = torch.as_tensor(clipped, dtype=torch.float32, device=device).mean().item()
         pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
 
         return loss_pi, pi_info
 
     # Set up function for computing value loss
     def compute_loss_v(data):
-        obs, ret = data['obs'], data['ret']
+        obs, ret = Variable(data['obs']), Variable(data['ret'])
         return ((ac.v(obs) - ret)**2).mean()
-    def compute_loss_v_pi(data):
-        obs, ret = data['obs'], data['ret']
-        return ((ac.v_pi(obs) - ret)**2).mean()
+
     # Set up optimizers for policy and value function
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
     vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
-    vf_pi_optimizer = Adam(ac.v_pi.parameters(), lr=vf_lr)
     # Set up model savingF
     logger.setup_pytorch_saver(ac)
     def update():
         data = buf.get()
-
         pi_l_old, pi_info_old = compute_loss_pi(data)
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
-
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
             pi_optimizer.zero_grad()
@@ -287,7 +175,6 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi.backward()
             mpi_avg_grads(ac.pi)    # average grads across MPI processes
             pi_optimizer.step()
-
         logger.store(StopIter=i)
 
         # Value function learning
@@ -304,127 +191,6 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                      KL=kl, Entropy=ent, ClipFrac=cf,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
                      DeltaLossV=(loss_v.item() - v_l_old))
-
-    def demo_update():
-        data = buf.get()
-        pi_l_old, pi_info_old = compute_loss_pi(data)
-        pi_l_old = pi_l_old.item()
-        v_l_old = compute_loss_v_pi(data).item()
-        for i in range(train_pi_iters):
-            pi_optimizer.zero_grad()
-            loss_pi, pi_info = compute_loss_pi(data)
-            kl = mpi_avg(pi_info['kl'])
-            if kl > 1.5 * target_kl:
-                # logger.log('Early stopping at step %d due to reaching max kl.' % i)
-                break
-            loss_pi.backward()
-            mpi_avg_grads(ac.pi)  # average grads across MPI processes
-            pi_optimizer.step()
-        logger.store(StopIter=i)
-        for i in range(train_v_iters):
-            vf_pi_optimizer.zero_grad()
-            loss_v = compute_loss_v_pi(data)
-            loss_v.backward()
-            mpi_avg_grads(ac.v_pi)
-            vf_pi_optimizer.step()
-        print("Pi loss:     {}".format(pi_l_old))
-        kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
-        logger.store(LossPi=pi_l_old, LossV=v_l_old,
-                     KL=kl, Entropy=ent, ClipFrac=cf,
-                     DeltaLossPi=(loss_pi.item() - pi_l_old),
-                     DeltaLossV=(loss_v.item() - v_l_old))
-
-    def update_vf():
-        data = buf.get()
-        v_l_old = compute_loss_v(data).item()
-        print("Loss for Value function: {}".format(v_l_old))
-        for i in range(train_v_iters):
-            vf_optimizer.zero_grad()
-            loss_v = compute_loss_v(data)
-            loss_v.backward()
-            mpi_avg_grads(ac.v)
-            vf_optimizer.step()
-
-    # pretraining epochs
-    # pi_epochs, vf_epochs = 100, 50
-
-    # demonstration training: main loop, for policy network
-    o, ep_ret, ep_len = demo_env.reset(), 0, 0
-    start_time = time.time()
-    for epoch in range(pi_epochs):
-        for t in range(steps_per_epoch):
-            a, v, logp_a, m, std = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
-            next_o, r, d, _ = demo_env.step(a, std)
-            ep_ret += r
-            ep_len += 1
-
-            buf.store(o, a, r, v, logp_a, std=std)
-            logger.store(VVals=v)
-            o = next_o
-            timeout = ep_len == max_ep_len
-            terminal = d or timeout
-            epoch_ended = t == steps_per_epoch - 1
-            if terminal or epoch_ended:
-                if epoch_ended and not (terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
-                # if trajectory didn't reach terminal state, bootstrap value target
-                if timeout or epoch_ended:
-                    _, v, _, _, _ = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32))
-                else:
-                    v = 0
-                if terminal:
-                    # only save EpRet / EpLen if trajectory finished
-                    logger.store(EpRet=ep_ret, EpLen=ep_len)
-                buf.finish_path(v)
-                o, ep_ret, ep_len = demo_env.reset(), 0, 0
-        demo_update()
-        # Log info about epoch
-        logger.log_tabular('Epoch', epoch)
-        logger.log_tabular('EpRet', with_min_and_max=True)
-        logger.log_tabular('EpLen', average_only=True)
-        logger.log_tabular('VVals', with_min_and_max=True)
-        logger.log_tabular('TotalEnvInteracts', (epoch + 1) * steps_per_epoch)
-        logger.log_tabular('LossPi', average_only=True)
-        logger.log_tabular('LossV', average_only=True)
-        logger.log_tabular('DeltaLossPi', average_only=True)
-        logger.log_tabular('DeltaLossV', average_only=True)
-        logger.log_tabular('Entropy', average_only=True)
-        logger.log_tabular('KL', average_only=True)
-        logger.log_tabular('ClipFrac', average_only=True)
-        logger.log_tabular('StopIter', average_only=True)
-        logger.log_tabular('Time', time.time() - start_time)
-        logger.dump_tabular()
-
-
-    # for the value function pre-training
-    o, ep_ret, ep_len = demo_env.reset(), 0, 0
-    start_time = time.time()
-    for epoch in range(vf_epochs):
-        for t in range(steps_per_epoch):
-            next_o, r, d, _, a = demo_env.free_step()
-            v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
-            ep_ret += r
-            ep_len += 1
-            buf.store(o, a, r, v, 1)
-            logger.store(VVals=v)
-            o = next_o
-            timeout = ep_len == max_ep_len
-            terminal = d or timeout
-            epoch_ended = t == steps_per_epoch - 1
-            if terminal or epoch_ended:
-                if epoch_ended and not (terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
-                # if trajectory didn't reach terminal state, bootstrap value target
-                if timeout or epoch_ended:
-                    v = ac.v(torch.as_tensor(o, dtype=torch.float32)).detach().numpy()
-                else:
-                    v = 0
-                buf.finish_path(v)
-                o, ep_ret, ep_len = demo_env.reset(), 0, 0
-        print("Pretraining for value function at Epoch: {}".format(epoch))
-        update_vf()
-
-
     # Prepare for interaction with environment
     start_time = time.time()
     o, ep_ret, ep_len = env.reset(), 0, 0
@@ -432,7 +198,7 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32, device=device))
 
             next_o, r, d, _ = env.step(a)
             ep_ret += r
@@ -454,7 +220,7 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32, device=device))
                 else:
                     v = 0
                 buf.finish_path(v)
@@ -462,7 +228,6 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
                 o, ep_ret, ep_len = env.reset(), 0, 0
-
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
@@ -497,13 +262,13 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=1)
+    parser.add_argument('--cpu', type=int, default=4)
     parser.add_argument('--steps', type=int, default=40000)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--exp_name', type=str, default='test')
     parser.add_argument('--demo-file', type=str, default='data/Ant50epoch.pickle')
-    parser.add_argument('--pi-epochs', type=int, default=100)
-    parser.add_argument('--vf-epochs', type=int, default=50)
+    parser.add_argument('--pi-epochs', type=int, default=10)
+    parser.add_argument('--vf-epochs', type=int, default=10)
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
