@@ -4,7 +4,7 @@ from torch.optim import Adam
 import gym
 import time
 
-
+from spinup.algos.pytorch.acdf_cuda.custom_saver import load_model
 import spinup.algos.pytorch.acdf_cuda.core as core
 from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch_cuda import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
@@ -95,8 +95,8 @@ class ACDFBuffer:
 
 
 def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
-        steps_per_epoch=4000, epochs=50, pi_epochs=100, vf_epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
+        steps_per_epoch=4000, epochs=50, pi_itr=10, vf_itr=10, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
+        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000, pretrain_model="",
         target_kl=0.01, logger_kwargs=dict(), save_freq=10):
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
@@ -118,8 +118,18 @@ def acdf(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Create actor-critic module
     ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs).to(device)
+    # for p in ac.pi.parameters():
+    #     print(torch.norm(p))
+    # print("????????????")
     # TODO: load the pretrain model
-
+    if len(pretrain_model) > 0:
+        load_model(ac_model=ac, fname=pretrain_model, pi_itr=pi_itr, vf_itr=vf_itr)
+        # for p in ac.pi.parameters():
+        #     print(torch.norm(p))
+    else:
+        print("No pretrained model is specified, the model will be trained from scratch")
+    import ipdb
+    ipdb.set_trace()
     # Sync params across processes
     sync_params(ac)
     # Count variables
@@ -266,9 +276,9 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=40000)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--exp_name', type=str, default='test')
-    parser.add_argument('--demo-file', type=str, default='data/Ant50epoch.pickle')
-    parser.add_argument('--pi-epochs', type=int, default=10)
-    parser.add_argument('--vf-epochs', type=int, default=10)
+    parser.add_argument('--pretrain-model', type=str, default="data/AntPretrain-test/AntPretrain_s0/pyt_save")
+    parser.add_argument('--pi-itr', type=int, default=100)
+    parser.add_argument('--vf-itr', type=int, default=10)
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
@@ -279,5 +289,5 @@ if __name__ == '__main__':
     acdf(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
-        pi_epochs=args.pi_epochs, vf_epochs=args.vf_epochs,
-        logger_kwargs=logger_kwargs, demo_file=args.demo_file)
+        pi_itr=args.pi_itr, vf_itr=args.vf_itr, pretrain_model=args.pretrain_model,
+        logger_kwargs=logger_kwargs)

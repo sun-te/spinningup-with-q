@@ -1,5 +1,5 @@
 import inspect
-
+from copy import deepcopy
 import numpy as np
 import torch
 from torch.optim import Adam
@@ -13,7 +13,10 @@ from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch_cuda import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools_cuda import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from spinup.algos.pytorch.acdf.demo_env import DemoGymEnv
-from .acdf_cuda import Variable, ACDFBuffer, acdf, device
+from spinup.algos.pytorch.acdf_cuda.acdf_cuda import Variable, ACDFBuffer, acdf, device
+from spinup.algos.pytorch.acdf_cuda.custom_saver import save_pi, save_vf
+
+SAVE_FREQ = [10, 50, 100, 200, 300, 400, 500, 1000, 2000]
 
 def pretrain(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 steps_per_epoch=4000, epochs=50, pi_epochs=100, vf_epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
@@ -21,7 +24,6 @@ def pretrain(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 target_kl=0.01, logger_kwargs=dict(), save_freq=10, demo_file=""):
 
     setup_pytorch_for_mpi()
-    tt()
     logger = EpochLogger(**logger_kwargs)
     # locals() return all local variable
     logger.save_config(locals())
@@ -47,13 +49,16 @@ def pretrain(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     buf = ACDFBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
 
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    vf_optimizer = Adam(ac.v_pi.parameters(), lr=vf_lr)
+    vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
+    vf_pi_optimizer = Adam(ac.v_pi.parameters(), lr=vf_lr)
 
     logger.setup_pytorch_saver(ac)
     def compute_loss_v(data):
         obs, ret = Variable(data['obs']), Variable(data['ret'])
+        return ((ac.v(obs) - ret)**2).mean()
+    def compute_loss_v_pi(data):
+        obs, ret = Variable(data['obs']), Variable(data['ret'])
         return ((ac.v_pi(obs) - ret)**2).mean()
-
     def demo_update():
         data = buf.get()
         pi_l_old, pi_info_old = compute_loss_pi(data)
@@ -70,13 +75,13 @@ def pretrain(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi.backward()
             mpi_avg_grads(ac.pi)  # average grads across MPI processes
             pi_optimizer.step()
-        # logger.store(StopIter=i)
+        logger.store(StopIter=i)
         for i in range(train_v_iters):
-            vf_optimizer.zero_grad()
-            loss_v = compute_loss_v(data)
+            vf_pi_optimizer.zero_grad()
+            loss_v = compute_loss_v_pi(data)
             loss_v.backward()
             mpi_avg_grads(ac.v_pi)
-            vf_optimizer.step()
+            vf_pi_optimizer.step()
         print("Pi loss:     {}".format(pi_l_old))
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
         logger.store(LossPi=pi_l_old, LossV=v_l_old,
@@ -102,13 +107,16 @@ def pretrain(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         return loss_pi, pi_info
 
+    buf = ACDFBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
     # pretraining epochs
-    # pi_epochs, vf_epochs = 100, 50
-
     # demonstration training: main loop, for policy network
     o, ep_ret, ep_len = demo_env.reset(), 0, 0
     start_time = time.time()
     for epoch in range(pi_epochs):
+
+        pi_old_data = [deepcopy(p.data) for p in ac.pi.parameters()]
+        vf_old_data = [deepcopy(p.data) for p in ac.v.parameters()]
+        vf_pi_old_data = [deepcopy(p.data) for p in ac.v_pi.parameters()]
         for t in range(local_steps_per_epoch):
             a, v, logp_a, m, std = ac.pretrain_step(torch.as_tensor(o, dtype=torch.float32, device=device))
             next_o, r, d, _ = demo_env.step(a, std)
@@ -134,11 +142,22 @@ def pretrain(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
                 buf.finish_path(v)
                 o, ep_ret, ep_len = demo_env.reset(), 0, 0
-        # Save model
-        if (epoch % save_freq == 0) or (epoch == pi_epochs-1):
-            logger.save_state({'env': env}, pi_epochs)
 
+
+        # Save model
+        # if (epoch % save_freq == 0) or (epoch == pi_epochs-1):
+        if (epoch in SAVE_FREQ) or (epoch == pi_epochs - 1):
+            save_pi(logger_kwargs.get('output_dir', "model"), itr=epoch, paramenters=ac.pi)
+            logger.save_state({'env': env}, None)
         demo_update()
+        delta_v, delta_v_pi, delta_pi = 0, 0, 0
+        for i, param in enumerate(ac.v_pi.parameters()):
+            delta_v_pi += torch.norm(param.data - vf_pi_old_data[i])
+        for i, param in enumerate(ac.v.parameters()):
+            delta_v += torch.norm(param.data - vf_old_data[i])
+        for i, param in enumerate(ac.pi.parameters()):
+            delta_pi += torch.norm(param.data - pi_old_data[i])
+        print("delta v_pi: {}; delta vf: {}; delta pi: {}".format(delta_v_pi, delta_v, delta_pi))
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
         logger.log_tabular('EpRet', with_min_and_max=True)
@@ -155,7 +174,58 @@ def pretrain(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('StopIter', average_only=True)
         logger.log_tabular('Time', time.time() - start_time)
         logger.dump_tabular()
-    return
+    logger.save_state({'env': env}, pi_epochs)
+    def update_vf():
+        data = buf.get()
+        v_l_old = compute_loss_v(data).item()
+        print("Loss for Value function: {}".format(v_l_old))
+        for i in range(train_v_iters):
+            vf_optimizer.zero_grad()
+            loss_v = compute_loss_v(data)
+            loss_v.backward()
+            mpi_avg_grads(ac.v)
+            vf_optimizer.step()
+    # for the value function pre-training
+    o, ep_ret, ep_len = demo_env.reset(), 0, 0
+    start_time = time.time()
+    for epoch in range(vf_epochs):
+        pi_old_data = [deepcopy(p.data) for p in ac.pi.parameters()]
+        vf_old_data = [deepcopy(p.data) for p in ac.v.parameters()]
+        vf_pi_old_data = [deepcopy(p.data) for p in ac.v_pi.parameters()]
+        for t in range(local_steps_per_epoch):
+            next_o, r, d, _, a = demo_env.free_step()
+            v = ac.v(torch.as_tensor(o, dtype=torch.float32, device=device)).cpu().detach().numpy()
+            ep_ret += r
+            ep_len += 1
+            buf.store(o, a, r, v, 1)
+            # logger.store(VVals=v)
+            o = next_o
+            timeout = ep_len == max_ep_len
+            terminal = d or timeout
+            epoch_ended = t == local_steps_per_epoch - 1
+            if terminal or epoch_ended:
+                if epoch_ended and not (terminal):
+                    print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
+                # if trajectory didn't reach terminal state, bootstrap value target
+                if timeout or epoch_ended:
+                    v = ac.v(torch.as_tensor(o, dtype=torch.float32, device=device)).cpu().detach().numpy()
+                else:
+                    v = 0
+                buf.finish_path(v)
+                o, ep_ret, ep_len = demo_env.reset(), 0, 0
+        print("Pretraining for value function at Epoch: {}".format(epoch))
+        update_vf()
+        delta_v, delta_v_pi, delta_pi = 0, 0, 0
+        for i, param in enumerate(ac.v_pi.parameters()):
+            delta_v_pi += torch.norm(param.data - vf_pi_old_data[i])
+        for i, param in enumerate(ac.v.parameters()):
+            delta_v += torch.norm(param.data - vf_old_data[i])
+        for i, param in enumerate(ac.pi.parameters()):
+            delta_pi += torch.norm(param.data - pi_old_data[i])
+        print("delta v_pi: {}; delta vf: {}; delta pi: {}".format(delta_v_pi, delta_v, delta_pi))
+        if (epoch in SAVE_FREQ) or (epoch == vf_epochs - 1):
+            save_vf(logger_kwargs.get('output_dir', "model"), itr=epoch, paramenters=ac.v)
+            logger.save_state({'env': env}, None)
 
 def get_default_args(func):
     signature = inspect.signature(func)
